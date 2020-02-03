@@ -1,0 +1,449 @@
+#!/bin/bash
+
+#Declaracion de colores en proceso
+GREEN_COLOUR='\x1B[32m'
+BLUE_COLOUR='\e[34m'
+YELLOW_COLOUR='\e[33m'
+RED_COLOUR='\e[31m'
+END_MOD_COLOUR='\e[0m'
+
+#Declaracion de constantes
+START_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+HOSTNAME=$(hostname)
+NAME="UDB_HIST"
+DIVISION="RED"
+AREA="ANALITICA Y EXPERIENCIA DE SERVICIOS"
+CONTACT="ROLANDO ESPIRITU"
+FILE="udb_hist"
+RESPONSIBLE="CARLOS SANCHEZ"
+PATH_REPORT="/space/scripts/udb"
+FULLPATH_REPORT="${PATH_REPORT}/${FILE}"
+PATH_MYSQL="/usr/local/mariadb/columnstore/mysql/bin"
+PATH_DB="/space/mariadb/columnstore/mysql/db"
+PROCESS_SUCCESS_MESSAGE="Process sucessfull"
+INCOMPLETE_INPUT_MESSAGE="Incomplete data input"
+INCOMPLETE_OUTPUT_MESSAGE="Incomplete data output"
+ERROR_PROCESS_MESSAGE="Error during the execution process"
+
+#Declaracion de variables
+udbDayTable=""
+udbDatabase="udb"
+udbBaseTable="udbbase"
+udbHistTable="udbhist"
+udbRxTable="udbhistrx"
+imsDatabase="ims"
+imsHistTable="imshist"
+flagTrackingReport=1
+messageReport=""
+dateTable=""
+
+#Funcion limpiar hosts activos
+cleanHosts() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] cleanHosts(): start[][]"
+    #Ejecuta script
+    ${PATH_MYSQL}/mysqladmin flush-hosts
+}
+
+#Funcion encontrar tabla udb del dia
+findUdbTable() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] findUdbTable(): exec[][]"
+    #Declaracion de variables
+    udbTemplateTable="udbYYYYMMDD"
+    loopQuantity=10
+    #Recorre rango de numeros para restar al dia actual
+    for x in $(eval echo "{1..$loopQuantity}"); do
+        #Obtiene fecha y construye nombre de tabla
+        dateFormat=$(date --date="-$x day" +"%Y%m%d")
+        dateDB=$(date --date="-$x day" +"%Y-%m-%d")
+        udbTable=$udbTemplateTable
+        udbTable=${udbTable/YYYYMMDD/$dateFormat}
+        #Valida existencia de tabla
+        flagExistenceTable=$(${PATH_MYSQL}/mysql -u root --password='' -e \
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+            WHERE (TABLE_SCHEMA = '${udbDatabase}') AND (TABLE_NAME = '${udbTable}')" -s);
+        if [[ ${flagExistenceTable} -eq 0 ]]; then
+            echo -e "\t${YELLOW_COLOUR}Tabla ${udbDatabase}.${udbTable} no existe${END_MOD_COLOUR}"
+            continue
+        fi
+        #Valida si tabla contiene registros
+        quantityTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+            "SELECT COUNT(*) FROM ${udbTable}" -s);
+        if [[ ${quantityTableRows} -eq 0 ]]; then
+            echo -e "\t${YELLOW_COLOUR}Tabla ${udbDatabase}.${udbTable} no contiene registros${END_MOD_COLOUR}"
+            continue
+        fi
+        # Valida que tabla destino no contenga data de la tabla udb seleccionada, se valida por la fecha.
+        quantityTableHistRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+            "SELECT COUNT(*) FROM ${udbHistTable} WHERE FECHA = '${dateDB}'" -s);
+        if [[ ${quantityTableHistRows} -gt 0 ]]; then
+            echo -e "\t${YELLOW_COLOUR}Tabla ${udbDatabase}.${udbHistTable} contiene registros para la tabla seleccionada.${END_MOD_COLOUR}"
+            exit 1
+        fi
+        #Guarda tabla encontrada de udb
+        udbDayTable=${udbTable}
+        dateTable=${dateDB}
+        break
+    done
+    #Valida variables mandatorias
+    if [ ${#udbDayTable} -eq 0 -o ${#dateTable} -eq 0  ]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}No se encontro tabla udb luego de ${loopQuantity} iteraciones recursivamente ${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_INPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_INPUT_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+    echo -e "\t${GREEN_COLOUR}Tabla ${udbDatabase}.${udbDayTable} encontrada${END_MOD_COLOUR}"
+    echo -e "\t${GREEN_COLOUR}Dia ${dateTable} encontrado${END_MOD_COLOUR}"
+}
+
+#Funcion valida tablas input
+validateInputTables() {
+    #Imprime en archivo log inicio de validacion de tablas input
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] validateInputTables(): exec[][]"
+    #Valida existencia de tabla
+    flagExistenceTable=$(${PATH_MYSQL}/mysql -u root --password='' -e \
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+        WHERE (TABLE_SCHEMA = '${imsDatabase}') AND (TABLE_NAME = '${imsHistTable}')" -s);
+    if [[ ${flagExistenceTable} -eq 0 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${imsDatabase}.${imsHistTable} no existe${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_INPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_INPUT_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+    #Valida si tabla contiene registros
+    quantityTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${imsDatabase} -e \
+        "SELECT COUNT(*) FROM ${imsHistTable}" -s);
+    if [[ ${quantityTableRows} -eq 0 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${YELLOW_COLOUR}Tabla ${imsDatabase}.${imsHistTable} no contiene registros. Algunos campos no se actualizaran${END_MOD_COLOUR}"
+        return 1
+    fi
+}
+
+#Funcion prepara tablas
+prepareTables() {
+    #Imprime en archivo log inicio de preparacion de tablas
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] prepareTables(): exec[][]"
+    #Declaracion de variables
+    udbTablesArr=(${udbHistTable} ${udbBaseTable})
+    #Recorre array de tablas udb
+    for udbTable in "${udbTablesArr[@]}"
+    do
+        #Valida existencia de tabla udb para detectar inconsistencia de data
+        flagExistenceTable=$(${PATH_MYSQL}/mysql -u root --password='' -e \
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+            WHERE (TABLE_SCHEMA = '${udbDatabase}') AND (TABLE_NAME = '${udbTable}')" -s);
+        if [[ ${flagExistenceTable} -eq 0 ]]; then
+            flagTrackingReport=0
+            echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${udbTable} no existe. Esta tabla es mandatoria, se terminara proceso ${END_MOD_COLOUR}"
+            echo -e "\t${RED_COLOUR}${INCOMPLETE_INPUT_MESSAGE}${END_MOD_COLOUR}"
+            messageReport=$INCOMPLETE_INPUT_MESSAGE
+            #Registra evento y finaliza script con errores
+            removeFiles
+            registerReportEvent
+            exit 1
+        fi
+    done
+    #Valida cantidades de data historica y base
+    histTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbHistTable}" -s);
+    baseTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbBaseTable}" -s);
+    if [[ $baseTableRows -gt $histTableRows ]]; then
+        echo -e "\t${YELLOW_COLOUR}Inconsistencia en tabla historica ${udbDatabase}.${udbHistTable} con respecto a tabla base ${udbDatabase}.${udbBaseTable}. Se actualizara con tabla base${END_MOD_COLOUR}"
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE ${udbHistTable}";
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "RENAME TABLE ${udbBaseTable} TO ${udbHistTable}";
+    fi
+    #Prepara tablas base e historica
+    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE IF EXISTS ${udbBaseTable}";
+    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "rename table ${udbHistTable} to ${udbBaseTable}";
+    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "create table ${udbHistTable} like ${udbBaseTable}";
+}
+
+#Funcion carga de data
+loadData() {
+    #Imprime en archivo log inicio de carga de data
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] loadData(): exec[][]"
+    #Inserta data actual
+    #/bin/time --format="\tInsert data actual a tabla ${udbDatabase}.${udbHistTable} %es" \
+    #    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+    #    "insert ${udbHistTable} (MSISDN, CARD_TYPE, OCSITPL, APN_TYPE, ODBPOS, EPSLOCK, LOCK_SGSNLCK, QOSTPLID, EPS_QOSTPL_ID,
+    #        TGPPAMBRMAXUL, TGPPAMBRMAXDL, ROUTECATEGORY, APNTPLID, MMEHOST, MMETIMESTAMP, VLR_NUMBER, MSC_NUMBER, fecha,
+    #        tplname, epsprov, mme_mcc, mme_mnc, xmmetimestamp, TCSITPL, TCSISTATE, IMSI_UDB)
+    #    select a.MSISDN, a.CARD_TYPE, a.OCSITPL, a.APN_TYPE, a.ODBPOS, a.EPSLOCK, a.LOCK_SGSNLCK, a.QOSTPLID, a.EPS_QOSTPL_ID,
+    #        a.TGPPAMBRMAXUL, a.TGPPAMBRMAXDL, a.ROUTECATEGORY, a.APNTPLID, a.MMEHOST, a.MMETIMESTAMP, a.VLR_NUMBER, a.MSC_NUMBER,
+    #        '${dateTable}' FECHA, case when a.OCSITPL IN (2,6,11,32767) then 1 else 0 end TPLNAME,
+    #        case when a.TGPPAMBRMAXUL = '256000000' and a.TGPPAMBRMAXDL = '256000000' then 1 else 0 end EPSPROV,
+    #        REGEXP_SUBSTR(a.MMEHOST, 'MCC[0-9]{1,}'), 
+    #        REGEXP_SUBSTR(a.MMEHOST, 'MNC[0-9]{1,}'),
+    #        case when MMETIMESTAMP <> '' then FROM_UNIXTIME(MMETIMESTAMP) else '0000-00-00 00:00:00' end XMMETIMESTAMP,
+    #        a.TCSITPL, a.TCSISTATE, a.IMSI IMSI_UDB, b.IMSI IMSI_IMS,
+    #        case when (a.imsi is not null and b.imsi is not null and a.imsi = b.imsi) and (a.TCSITPL is not null and a.TCSITPL = 4) 
+    #                    and (a.TCSISTATE is not null and a.TCSISTATE = 'YES') and (a.APNTPLID is not null and INSTR(a.APNTPLID, '40') > 0) then 1
+    #            else 0
+    #        end volteprov
+    #    from ${udbDayTable} a
+    #    left join ${imsDatabase}.${imsHistTable} b on a.msisdn = b.subid
+    #    where msisdn > 0";
+
+    /bin/time --format="\tInsert data actual a tabla ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "INSERT IGNORE ${udbHistTable} (MSISDN, CARD_TYPE, OCSITPL, APN_TYPE, ODBPOS, EPSLOCK, LOCK_SGSNLCK, QOSTPLID, EPS_QOSTPL_ID,
+        TGPPAMBRMAXUL, TGPPAMBRMAXDL, ROUTECATEGORY, APNTPLID, MMEHOST, MMETIMESTAMP, VLR_NUMBER, MSC_NUMBER, fecha,
+        tplname, epsprov, xmmetimestamp, TCSITPL, TCSISTATE, IMSI_UDB)
+        select a.MSISDN, a.CARD_TYPE, a.OCSITPL, a.APN_TYPE, a.ODBPOS, a.EPSLOCK, a.LOCK_SGSNLCK, a.QOSTPLID, a.EPS_QOSTPL_ID,
+            a.TGPPAMBRMAXUL, a.TGPPAMBRMAXDL, a.ROUTECATEGORY, a.APNTPLID, a.MMEHOST, a.MMETIMESTAMP, a.VLR_NUMBER, a.MSC_NUMBER,
+            '${dateTable}' FECHA, 
+            case when a.OCSITPL IN (2,6,11,32767) then 1 else 0 end TPLNAME,
+            case when a.TGPPAMBRMAXUL = '256000000' and a.TGPPAMBRMAXDL = '256000000' then 1 else 0 end EPSPROV,
+            case when MMETIMESTAMP <> '' then FROM_UNIXTIME(MMETIMESTAMP) else '0000-00-00 00:00:00' end XMMETIMESTAMP,
+            a.TCSITPL, 
+            a.TCSISTATE, 
+            a.IMSI IMSI_UDB
+        from ${udbDayTable} a
+        where msisdn > 0";
+
+    /bin/time --format="\tUpdate host ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "update ${udbHistTable} a, ${udbDayTable} b 
+        set a.mme_mcc = regexp_substr(b.mmehost, 'mcc[0-9]{1,}'), 
+            a.mme_mnc = regexp_substr(b.mmehost, 'mnc[0-9]{1,}')
+        where a.msisdn = b.msisdn";
+    
+    /bin/time --format="\tUpdate volteprov ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "update ${udbHistTable} a, ${imsDatabase}.${imsHistTable} b  
+        set a.IMSI_IMS = b.IMSI, 
+        a.volteprov = (
+            case when (a.imsi_udb is not null and b.imsi is not null and a.imsi_udb = b.imsi) 
+                and (a.TCSITPL is not null and a.TCSITPL = 4)
+                and (a.TCSISTATE is not null and a.TCSISTATE = 'YES') 
+                and (a.APNTPLID is not null and INSTR(a.APNTPLID, '40') > 0) then 1 else 0 
+            end 
+        ) where a.msisdn = b.subid and a.TCSITPL = 4";
+
+    #Inserta data historica desde base
+    /bin/time --format="\tInsert data historica a tabla ${udbDatabase}.${udbHistTable} desde ${udbDatabase}.${udbBaseTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "INSERT IGNORE ${udbHistTable} (MSISDN, CARD_TYPE, OCSITPL, APN_TYPE, ODBPOS, EPSLOCK, LOCK_SGSNLCK, QOSTPLID, EPS_QOSTPL_ID,
+            TGPPAMBRMAXUL, TGPPAMBRMAXDL, ROUTECATEGORY, APNTPLID, MMEHOST, MMETIMESTAMP, VLR_NUMBER, MSC_NUMBER, fecha,
+            tplname, epsprov, mme_mcc, mme_mnc, xmmetimestamp, TCSITPL, TCSISTATE, IMSI_UDB, IMSI_IMS, volteprov)
+        SELECT MSISDN, CARD_TYPE, OCSITPL, APN_TYPE, ODBPOS, EPSLOCK, LOCK_SGSNLCK, QOSTPLID, EPS_QOSTPL_ID,
+            TGPPAMBRMAXUL, TGPPAMBRMAXDL, ROUTECATEGORY, APNTPLID, MMEHOST, MMETIMESTAMP, VLR_NUMBER, MSC_NUMBER,
+            FECHA, TPLNAME, EPSPROV, MME_MCC, MME_MNC, XMMETIMESTAMP, TCSITPL, TCSISTATE, IMSI_UDB, IMSI_IMS, volteprov
+        FROM ${udbBaseTable}
+        where msisdn > 0";
+}
+
+#Funcion valida carga de data
+validateData() {
+    #Imprime en archivo log inicio de validacion de data
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] validateData(): exec[][]"
+    #Valida cantidad de registros en tabla historica
+    quantityHistTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbHistTable}" -s);
+    if [[ ${quantityHistTableRows} -eq 0 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${quantityHistTableRows} no contiene registros${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_OUTPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_OUTPUT_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+    #Valida que cantidad de hist tenga igual o mas que base
+    quantityBaseTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbBaseTable}" -s);
+    if [[ $quantityBaseTableRows -gt $quantityHistTableRows ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${udbHistTable} tiene menos registros que tabla ${udbDatabase}.${udbBaseTable}. Se reestablecera data con tabla base${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_OUTPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_OUTPUT_MESSAGE
+        #Reestablece data con tabla base
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "rename table ${udbBaseTable} to ${udbHistTable}";
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "create table ${udbBaseTable} like ${udbHistTable}";
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+}
+
+#Funcion sincroniza tabla columnstore
+syncColumnStoreTable() {
+    #Imprime en archivo log inicio de sincronizacion de tabla columnstore
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] syncColumnStoreTable(): exec[][]"
+    #Declaracion de variables
+    columnsQuantity=6
+    rowsQuantity=0
+    itemsQuantity=0
+    nullableValue=""
+    addColumnTempl="alter table databaseName.tableName add column columnName columnType nullableType"
+    addColumnSentence=""
+    columnNameValue=""
+    #Obtiene cantidad de cambios
+    amountOfChanges=$(${PATH_MYSQL}/mysql -u root --password='' -e \
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE table_schema = '${udbDatabase}' and table_name = '${udbHistTable}'
+            and (COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT) not in (
+                SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE table_schema = '${udbDatabase}' and table_name = '${udbRxTable}' 
+            )" -s);
+    #Valida cantidad de cambios para actualizar a tabla columnstore
+    if [[ ${amountOfChanges} -eq 0 ]]; then
+        return 0
+    fi
+    echo -e "\t${YELLOW_COLOUR}Se detectaron cambios en columnas desde la tabla ${udbDatabase}.${udbHistTable} a la tabla ${udbDatabase}.${udbRxTable}${END_MOD_COLOUR}"
+    #Elimina tabla columnstore
+    /bin/time --format="\tDrop tabla ${udbDatabase}.${udbRxTable} para volver a crear en el orden de tabla ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "drop table if exists ${udbRxTable}";
+    #Crea tabla columnstore con columna mandatoria inicial
+    /bin/time --format="\tCreate tabla ${udbDatabase}.${udbRxTable} con campo inicial y mandatorio msisdn %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "CREATE TABLE ${udbRxTable} (
+	        MSISDN bigint(20) unsigned NOT NULL
+        ) ENGINE=Columnstore DEFAULT CHARSET=latin1 COMMENT='compression=1'";
+    #Compara columnas con tabla historica y tabla columnstore
+    queryResult=$(${PATH_MYSQL}/mysql -u root --password='' --skip-column-names -e \
+        "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, REPLACE(COLUMN_TYPE, ' ', '') COLUMN_TYPE, 
+            IS_NULLABLE, REPLACE(COLUMN_DEFAULT, ' ', '') COLUMN_DEFAULT
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE table_schema = '${udbDatabase}' and table_name = '${udbHistTable}'
+            and (COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT) not in (
+                SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE table_schema = '${udbDatabase}' and table_name = '${udbRxTable}' 
+            )" -s);
+    #Recorre resultado de query para agregar columnas faltantes
+    for item in $queryResult; do
+        #Inicializa columna
+        if [[ $itemsQuantity -eq 0 ]]; then
+            rowsQuantity=$(( rowsQuantity + 1 ))
+            addColumnSentence=${addColumnTempl}
+        fi
+        #Obtiene datos de columnas, cada dato de una columna viene por item, por eso se realiza la iteracion,
+        #se reemplaza el valor de cada dato de la columna en la sentencia para agregar columna
+        itemsQuantity=$(( itemsQuantity + 1 ))
+        value=${item}
+        if [[ $itemsQuantity -eq 1 ]]; then
+            addColumnSentence=${addColumnSentence/databaseName/$value}
+        elif [[ $itemsQuantity -eq 2 ]]; then
+            addColumnSentence=${addColumnSentence/tableName/$udbRxTable}
+        elif [[ $itemsQuantity -eq 3 ]]; then
+            columnNameValue=${value}
+            addColumnSentence=${addColumnSentence/columnName/$value}
+        elif [[ $itemsQuantity -eq 4 ]]; then
+            #Reemplaza valores que tengan unsigned dandole un espacio
+            value=${value/unsigned/ unsigned}
+            addColumnSentence=${addColumnSentence/columnType/$value}
+        elif [[ $itemsQuantity -eq 5 ]]; then
+            #Valida si el dato debe ser nulo o no
+            if [[ $value = "NO" ]]; then
+                nullableValue="NOT NULL"
+            else
+                nullableValue="NULL"
+            fi
+            addColumnSentence=${addColumnSentence/nullableType/$nullableValue}
+        elif [[ $itemsQuantity -eq 6 ]]; then
+            #Reemplaza valores que sean datetime dandole un espacio entre elformato de dias y tiempo
+            value=${value/00:00:00/ 00:00:00}
+            #Valida si dato default tiene valor para agregar a sentencia de agregar columna
+            if [[ $value != "NULL" ]]; then
+                addColumnSentence="${addColumnSentence} DEFAULT ${value}"
+            fi
+        fi
+        #Valida que se hayan recolectado los datos de una columna
+        if [[ $itemsQuantity -ge $columnsQuantity ]]; then
+            #Reinicia contador de columna para buscar la siguiente columna
+            itemsQuantity=0
+            echo -e "\t${GREEN_COLOUR}Se adicionara columna ${columnNameValue} a tabla ${udbDatabase}.${udbRxTable} porque es diferente desde la tabla ${udbDatabase}.${udbHistTable}${END_MOD_COLOUR}"
+            #Agrega columna a tabla columnstore
+            ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "${addColumnSentence}";
+            continue
+        fi
+    done
+}
+
+#Funcion sincronizar servidores remotos
+syncRemoteServers() {
+    #Imprime en archivo log inicio de sincronizacion de servidores remotos
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] syncRemoteServers(): exec[][]"
+    #Declaracion de variables
+    ipServersArr=("10.95.168.20" "172.16.102.102" "172.16.102.103" "172.16.102.104" "172.16.102.100")
+    #ipServersArr=("172.16.102.100")
+    remotePath="/space/scripts/udb"
+    dumpFilename="udb_hist_dump"
+    prepareWorkSpaceScript="udb_hist_workspace"
+    gitChangesFilename="udb_hist_git_changes"
+    #Recorre ips de servidores
+    for ipServer in "${ipServersArr[@]}"; do
+        echo -e "\n\t${BLUE_COLOUR}Enviando scripts para sincronizacion hacia servidor ${ipServer}${END_MOD_COLOUR}"
+        #Ejecucion de archivo de preparacion de espacio de trabajo
+        ${PATH_REPORT}/${prepareWorkSpaceScript} "${ipServer}"
+        #Envia archivo dump y dar permisos
+        ssh root@${ipServer} "rm -rf ${remotePath}/temp/${dumpFilename}"
+        scp ${PATH_REPORT}/${dumpFilename} root@${ipServer}:${remotePath}/temp/
+        ssh root@${ipServer} "chmod 555 ${remotePath}/temp/${dumpFilename}"
+        #Envia archivo git y crea o valida cambios
+        scp ${PATH_REPORT}/${gitChangesFilename} root@${ipServer}:${remotePath}/temp/
+        userName=$(git config --global user.name)
+        userEmail=$(git config --global user.email)
+        ssh root@${ipServer} "sh ${remotePath}/temp/${gitChangesFilename} '${userName}' '${userEmail}' ${dumpFilename}"
+        ssh root@${ipServer} "rm -rf ${remotePath}/temp/${gitChangesFilename}"
+        #Ejecuta script remotamente
+        ssh root@${ipServer} "${remotePath}/${dumpFilename} > ${remotePath}/logs/error_log 2>&1" &
+    done
+    wait
+}
+
+#Funcion elimina archivos usados en proceso localmente
+removeFiles() {
+    #Imprime en archivo log inicio de eliminado de archivos
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] removeFiles(): exec[][]"
+    #Elimina archivos de ruta temp de reporte
+    rm -f ${PATH_REPORT}/temp/* 
+}
+
+#Funcion registra evento de reporte
+registerReportEvent() {
+    #Imprime en archivo log inicio de registro de evento de reporte
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] registerReportEvent(): end[][]"
+    # Reinicia el contador de conexiones fallidas hacia la BD del servidor
+    ssh root@10.95.168.20 ${PATH_MYSQL}/mysqladmin flush-hosts
+    #Valida flag de seguimiento de reporte
+    if [ "${flagTrackingReport}" -eq 1 ]
+    then
+        messageReport=$PROCESS_SUCCESS_MESSAGE
+    fi
+    #Asigna a variable fecha fin de proceso
+    END_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+    #Asigna a variable duracion de proceso
+    DURATION=$(( ($(date --date "$END_DATE" +%s) - $(date --date "$START_DATE" +%s) ) ))
+    #Inserta evento de ejecucion de reporte
+    queryEvent="insert into query_events_exec value (null, '$HOSTNAME', '$NAME', '$DIVISION', '$AREA', '$CONTACT',
+                '$RESPONSIBLE', '$FULLPATH_REPORT', '$START_DATE', '$END_DATE', '$DURATION', '$flagTrackingReport',
+                '$messageReport')";
+    ${PATH_MYSQL}/mysql -h 10.95.168.20 -u admin --password='' query_reports -e "${queryEvent}";
+    echo ""
+}
+
+#Ejecuta funciones
+cleanHosts
+findUdbTable
+validateInputTables
+prepareTables
+loadData
+validateData
+syncColumnStoreTable
+syncRemoteServers
+removeFiles
+registerReportEvent
