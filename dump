@@ -1,0 +1,248 @@
+#!/bin/bash
+
+#Declaracion de colores en proceso
+GREEN_COLOUR='\x1B[32m'
+BLUE_COLOUR='\e[34m'
+YELLOW_COLOUR='\e[33m'
+RED_COLOUR='\e[31m'
+END_MOD_COLOUR='\e[0m'
+
+#Declaracion de constantes
+START_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+HOSTNAME=$(hostname)
+NAME="UDB_HIST_DUMP"
+DIVISION="RED"
+AREA="ANALITICA Y EXPERIENCIA DE SERVICIOS"
+CONTACT="ROLANDO ESPIRITU"
+FILE="udb_hist_dump"
+RESPONSIBLE="CARLOS SANCHEZ"
+PATH_REPORT="/space/scripts/udb"
+FULLPATH_REPORT="${PATH_REPORT}/${FILE}"
+PATH_MYSQL="/usr/local/mariadb/columnstore/mysql/bin"
+PATH_DB="/space/mariadb/columnstore/mysql/db"
+PROCESS_SUCCESS_MESSAGE="Process sucessfull"
+INCOMPLETE_INPUT_MESSAGE="Incomplete data input"
+INCOMPLETE_OUTPUT_MESSAGE="Incomplete data output"
+ERROR_PROCESS_MESSAGE="Error during the execution process"
+
+#Declaracion de variables
+udbDatabase="udb"
+udbBaseTable="udbbase"
+udbHistTable="udbhist"
+udbRxTable="udbhistrx"
+flagTrackingReport=1
+messageReport=""
+remoteIpServer="172.16.102.101"
+dataHistTableFilename="${udbHistTable}_data.sql"
+
+#Funcion extraer creacion de tablas
+dumpCreationTables() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] dumpCreationTables(): start[][]"
+    #Declaracion de variables
+    tablesArr=(${udbRxTable} ${udbHistTable})
+    #Recorre tablas
+    for tableItem in "${tablesArr[@]}"; do
+        echo -e "\t${BLUE_COLOUR}Dump creacion de tabla para ${udbDatabase}.${tableItem} desde servidor ${remoteIpServer}${END_MOD_COLOUR}"
+        # Reinicia el contador de conexiones fallidas hacia la BD del servidor
+        ssh root@${remoteIpServer} ${PATH_MYSQL}/mysqladmin flush-hosts
+        #Valida existencia de tabla
+        flagExistenceTable=$(${PATH_MYSQL}/mysql -h ${remoteIpServer} -u admin --password='' -e \
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+            WHERE (TABLE_SCHEMA = '${udbDatabase}') AND (TABLE_NAME = '${tableItem}')" -s);
+        if [[ ${flagExistenceTable} -eq 0 ]]; then
+            flagTrackingReport=0
+            echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${tableItem} no existe. Terminara el proceso${END_MOD_COLOUR}"
+            echo -e "\t${RED_COLOUR}${ERROR_PROCESS_MESSAGE}${END_MOD_COLOUR}"
+            messageReport=$ERROR_PROCESS_MESSAGE
+            #Registra evento y finaliza script con errores
+            removeFiles
+            registerReportEvent
+            exit 1
+        fi
+        #Construye archivo de creacion de tabla
+        rm -f "${PATH_REPORT}/temp/${tableItem}_creation_table.sql"
+        touch "${PATH_REPORT}/temp/${tableItem}_creation_table.sql"
+        queryResult=$(${PATH_MYSQL}/mysql -h ${remoteIpServer} -u admin --password='' ${udbDatabase} -e \
+            "show create table ${tableItem}" -s);
+        queryResult=${queryResult/$tableItem/}
+        queryResult=${queryResult//\\n/}
+        echo "${queryResult}" >> "${PATH_REPORT}/temp/${tableItem}_creation_table.sql"
+        #Valida existencia de archivo creado
+        if [ ! -f "${PATH_REPORT}/temp/${tableItem}_creation_table.sql" ]; then
+            flagTrackingReport=0
+            echo -e "\t${RED_COLOUR}Archivo ${PATH_REPORT}/temp/${tableItem}_creation_table.sql no encontrado${END_MOD_COLOUR}"
+            echo -e "\t${RED_COLOUR}${ERROR_PROCESS_MESSAGE}${END_MOD_COLOUR}"
+            messageReport=$ERROR_PROCESS_MESSAGE
+            #Registra evento y finaliza script con errores
+            removeFiles
+            registerReportEvent
+            exit 1
+        fi
+    done
+}
+
+#Funcion extraer tabla historica
+dumpHistTable() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] dumpHistTable(): exec[][]"
+    #Construye archivo dump de data
+    /bin/time --format="\tDump a tabla ${udbDatabase}.${udbHistTable} desde servidor ${remoteIpServer} %es" \
+        /usr/local/mariadb/columnstore/mysql/bin/mysqldump -h ${remoteIpServer} -u admin --password='' \
+        ${udbDatabase} ${udbHistTable} > "${PATH_REPORT}/temp/${dataHistTableFilename}"
+    if [ ! -f "${PATH_REPORT}/temp/${dataHistTableFilename}" ]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Archivo ${PATH_REPORT}/temp/${dataHistTableFilename} no encontrado${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${ERROR_PROCESS_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$ERROR_PROCESS_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+}
+
+#Funcion prepara tablas
+prepareTables() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] prepareTables(): exec[][]"
+    #Valida cantidades de data historica y base
+    histTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbHistTable}" -s);
+    baseTableRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbBaseTable}" -s);
+    if [[ $baseTableRows -gt $histTableRows ]]; then
+        echo -e "\t${YELLOW_COLOUR}Inconsistencia en tabla historica ${udbDatabase}.${udbHistTable} con respecto a tabla base ${udbDatabase}.${udbBaseTable}. Se actualizara con tabla base${END_MOD_COLOUR}"
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE ${udbHistTable}";
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "RENAME TABLE ${udbBaseTable} TO ${udbHistTable}";
+    fi
+    #Prepara tablas base e historica
+    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE IF EXISTS ${udbBaseTable}";
+    ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "rename table ${udbHistTable} to ${udbBaseTable}";
+}
+
+#Funcion carga dump de tabla historica
+loadDumpHistTable() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] loadDumpHistTable(): exec[][]"
+    #Carga dump de tabla historica 
+    /bin/time --format="\tLoad dump ${PATH_REPORT}/temp/${dataHistTableFilename} para tabla historica %es" \
+        ${PATH_MYSQL}/mysql -u root ${udbDatabase} < ${PATH_REPORT}/temp/${dataHistTableFilename}
+}
+
+#Funcion valida carga de dump
+validateLoadDump() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] validateLoadDump(): exec[][]"
+    #Valida existencia de tabla historica
+    flagExistenceTable=$(${PATH_MYSQL}/mysql -u root --password='' -e \
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+        WHERE (TABLE_SCHEMA = '${udbDatabase}') AND (TABLE_NAME = '${udbHistTable}')" -s);
+    if [[ ${flagExistenceTable} -eq 0 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${udbHistTable} no existe. Terminara el proceso${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_OUTPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_OUTPUT_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+    #Valida cantidad de registros de tabla historica
+    quantityRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbHistTable}" | egrep "[0-9]{1,}");
+    if [[ $quantityRows -le 30000000 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${udbHistTable} tiene igual o menos que 1000000 registros. Terminara el proceso${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_OUTPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_OUTPUT_MESSAGE
+        #Reestablece tabla historica desde tabla base
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE IF EXISTS ${udbHistTable}";
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "rename table ${udbBaseTable} to ${udbHistTable}";
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+    
+    # Repara la tabla historica
+    /bin/time --format="\tRepara tabla ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "REPAIR TABLE ${udbHistTable}";
+    #Valida cantidad de registros de tabla historica
+    quantityRows=$(${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "SELECT COUNT(*) FROM ${udbHistTable}" | egrep "[0-9]{1,}");
+    if [[ $quantityRows -le 30000000 ]]; then
+        flagTrackingReport=0
+        echo -e "\t${RED_COLOUR}Tabla ${udbDatabase}.${udbHistTable} tiene igual o menos que 30000000 registros. Luego de reparar la tabla. Terminara el proceso${END_MOD_COLOUR}"
+        echo -e "\t${RED_COLOUR}${INCOMPLETE_OUTPUT_MESSAGE}${END_MOD_COLOUR}"
+        messageReport=$INCOMPLETE_OUTPUT_MESSAGE
+        #Registra evento y finaliza script con errores
+        removeFiles
+        registerReportEvent
+        exit 1
+    fi
+}
+
+#Funcion actualiza estructura de tabla base
+updateStructureBaseTable(){
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] updateStructureBaseTable(): exec[][]"
+    #Borra tabla base
+    /bin/time --format="\tDrop tabla ${udbDatabase}.${udbBaseTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE IF EXISTS ${udbBaseTable}";
+    #Reemplaza nombre base con nombre hist en dump de creacion de tabla
+    sed -i "s/$udbHistTable/$udbBaseTable/g" ${PATH_REPORT}/temp/${udbHistTable}_creation_table.sql
+    #Carga dump de creacion de tabla
+    /bin/time --format="\tLoad dump para creacion de tabla ${udbDatabase}.${udbBaseTable} %es" \
+        ${PATH_MYSQL}/mysql -u root ${udbDatabase} < ${PATH_REPORT}/temp/${udbHistTable}_creation_table.sql
+}
+
+#Funcion actualiza tabla columnstore
+updateColumnStoreTable() {
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] updateColumnStoreTable(): exec[][]"
+    #Borra tabla columnstore
+    /bin/time --format="\tDrop tabla ${udbDatabase}.${udbRxTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e "DROP TABLE IF EXISTS ${udbRxTable}";
+    #Reemplaza nombre modelo de columnstore con nombre de tabla de servidor
+    sed -i "s/$udbRxTable/$udbRxTable/g" ${PATH_REPORT}/temp/${udbRxTable}_creation_table.sql
+    #Carga dump de creacion de tabla
+    /bin/time --format="\tLoad dump para creacion de tabla ${udbDatabase}.${udbRxTable} %es" \
+        ${PATH_MYSQL}/mysql -u root ${udbDatabase} < ${PATH_REPORT}/temp/${udbRxTable}_creation_table.sql
+    #Inserta data desde tabla historica
+    /bin/time --format="\tInsert data a tabla ${udbDatabase}.${udbRxTable} desde tabla ${udbDatabase}.${udbHistTable} %es" \
+        ${PATH_MYSQL}/mysql -u root --password='' ${udbDatabase} -e \
+        "INSERT INTO ${udbRxTable} SELECT * FROM ${udbHistTable}";
+}
+
+#Funcion elimina archivos usados en proceso localmente
+removeFiles() {
+    #Imprime en archivo log inicio de eliminado de archivos
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] removeFiles(): exec[][]"
+    #Elimia archivos de ruta temporal de reporte
+    rm -f ${PATH_REPORT}/temp/*
+}
+
+#Funcion registra evento de reporte
+registerReportEvent() {
+    #Imprime en archivo log inicio de registro de evento de reporte
+    echo -e "\n[$(date +"%Y-%m-%d %H:%M:%S")] registerReportEvent(): end[][]\n"
+    #Valida flag de seguimiento de reporte
+    if [ "${flagTrackingReport}" -eq 1 ]
+    then
+        messageReport=$PROCESS_SUCCESS_MESSAGE
+    fi
+    #Asigna a variable fecha fin de proceso
+    END_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+    #Asigna a variable duracion de proceso
+    DURATION=$(( ($(date --date "$END_DATE" +%s) - $(date --date "$START_DATE" +%s) ) ))
+    #Inserta evento de ejecucion de reporte
+    queryEvent="insert into query_events_exec value (null, '$HOSTNAME', '$NAME', '$DIVISION', '$AREA', '$CONTACT',
+                '$RESPONSIBLE', '$FULLPATH_REPORT', '$START_DATE', '$END_DATE', '$DURATION', '$flagTrackingReport',
+                '$messageReport')";
+    ${PATH_MYSQL}/mysql -h 10.95.168.20 -u admin --password='' query_reports -e "${queryEvent}";
+}
+
+#Ejecuta funciones
+dumpCreationTables
+dumpHistTable
+prepareTables
+loadDumpHistTable
+validateLoadDump
+updateStructureBaseTable
+updateColumnStoreTable
+removeFiles
+registerReportEvent
